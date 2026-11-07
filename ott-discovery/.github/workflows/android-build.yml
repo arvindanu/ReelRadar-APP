@@ -1,0 +1,100 @@
+name: Android APK
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: write
+env:
+  NODE_VERSION: '22.16.0'
+  JAVA_VERSION: '21'
+  ANDROID_WEB_URL: ${{ vars.ANDROID_WEB_URL || 'https://reelradar-ott-app.vercel.app' }}
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+      - uses: android-actions/setup-android@v3
+      - name: Install pinned Android SDK packages
+        run: sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+      - name: Install web dependencies
+        run: npm ci
+      - name: Build and validate Next.js website
+        env:
+          TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
+        run: |
+          test -n "$ANDROID_WEB_URL" || { echo '::error::Set the ANDROID_WEB_URL repository variable.'; exit 1; }
+          npm run build
+      - name: Install pinned Capacitor toolchain
+        run: npm install --no-save --no-package-lock @capacitor/core@7.4.3 @capacitor/android@7.4.3 @capacitor/cli@7.4.3 @capacitor/app@7.1.0
+      - name: Generate and sync Android project
+        run: |
+          npx cap add android
+          npx cap sync android
+      - name: Set monotonically increasing Android version
+        run: |
+          sed -i "s/versionCode [0-9]*/versionCode ${GITHUB_RUN_NUMBER}/" android/app/build.gradle
+          sed -i 's/versionName "[^"]*"/versionName "1.0.'"${GITHUB_RUN_NUMBER}"'"/' android/app/build.gradle
+      - name: Set up Gradle and cache
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+      - name: Build debug APK
+        run: gradle -p android assembleDebug --no-daemon
+      - name: Check signing configuration
+        id: signing
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Signing secrets are absent or incomplete; debug APK will still be produced."
+          fi
+      - name: Build release variant when signing secrets are available
+        if: steps.signing.outputs.enabled == 'true'
+        run: gradle -p android assembleRelease --no-daemon
+      - name: Sign release APK
+        if: steps.signing.outputs.enabled == 'true'
+        uses: r0adkll/sign-android-release@v1
+        with:
+          releaseDirectory: android/app/build/outputs/apk/release
+          signingKeyBase64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          alias: ${{ secrets.ANDROID_KEY_ALIAS }}
+          keyStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reelradar-debug-apk-${{ github.run_number }}
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload signed release APK
+        if: steps.signing.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: reelradar-release-apk-${{ github.run_number }}
+          path: android/app/build/outputs/apk/release/*-signed.apk
+          if-no-files-found: error
+          retention-days: 30
+      - name: Attach APK to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            android/app/build/outputs/apk/debug/*.apk
+            android/app/build/outputs/apk/release/*-signed.apk
