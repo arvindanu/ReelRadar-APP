@@ -1,56 +1,114 @@
 name: Android APK
+
 on:
   push:
     branches: [main]
     tags: ['v*']
   workflow_dispatch:
+
 permissions:
   contents: write
+
 env:
   NODE_VERSION: '22.16.0'
   JAVA_VERSION: '21'
   ANDROID_WEB_URL: ${{ vars.ANDROID_WEB_URL || 'https://reelradar-ott-app.vercel.app' }}
+  ANDROID_COMPILE_SDK: '35'
+  ANDROID_BUILD_TOOLS: '35.0.0'
+
 jobs:
   build:
     runs-on: ubuntu-24.04
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
           cache-dependency-path: package-lock.json
-      - uses: actions/setup-java@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
-      - uses: android-actions/setup-android@v3
-      - name: Install pinned Android SDK packages
-        run: sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      # Install Android command-line tools without requesting
+      # the obsolete standalone "tools" SDK package.
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Installing Android SDK packages..."
+
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-${ANDROID_COMPILE_SDK}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}"
+
+          yes | sdkmanager --licenses >/dev/null || true
+
+          echo "Android SDK installation completed."
+
+      - name: Verify Android SDK
+        run: |
+          sdkmanager --list_installed
+          adb version
+
       - name: Install web dependencies
         run: npm ci
-      - name: Build and validate Next.js website
+
+      - name: Validate configuration and build website
         env:
           TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
         run: |
-          test -n "$ANDROID_WEB_URL" || { echo '::error::Set the ANDROID_WEB_URL repository variable.'; exit 1; }
+          set -e
+
+          test -n "$ANDROID_WEB_URL" || {
+            echo "::error::ANDROID_WEB_URL is missing."
+            exit 1
+          }
+
           npm run build
+
       - name: Install pinned Capacitor toolchain
-        run: npm install --no-save --no-package-lock @capacitor/core@7.4.3 @capacitor/android@7.4.3 @capacitor/cli@7.4.3 @capacitor/app@7.1.0
+        run: |
+          npm install --no-save --no-package-lock \
+            @capacitor/core@7.4.3 \
+            @capacitor/android@7.4.3 \
+            @capacitor/cli@7.4.3 \
+            @capacitor/app@7.1.0
+
       - name: Generate and sync Android project
         run: |
           npx cap add android
           npx cap sync android
-      - name: Set monotonically increasing Android version
+
+      - name: Set Android version
         run: |
+          set -e
+
           sed -i "s/versionCode [0-9]*/versionCode ${GITHUB_RUN_NUMBER}/" android/app/build.gradle
+
           sed -i 's/versionName "[^"]*"/versionName "1.0.'"${GITHUB_RUN_NUMBER}"'"/' android/app/build.gradle
+
       - name: Set up Gradle and cache
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
+
       - name: Build debug APK
-        run: gradle -p android assembleDebug --no-daemon
+        run: |
+          gradle -p android assembleDebug --no-daemon
+
       - name: Check signing configuration
         id: signing
         env:
@@ -59,15 +117,21 @@ jobs:
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          if [ -n "$KEYSTORE_B64" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ]; then
+          if [ -n "$KEYSTORE_B64" ] && \
+             [ -n "$KEY_ALIAS" ] && \
+             [ -n "$KEYSTORE_PASSWORD" ] && \
+             [ -n "$KEY_PASSWORD" ]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             echo "Signing secrets are absent or incomplete; debug APK will still be produced."
           fi
-      - name: Build release variant when signing secrets are available
+
+      - name: Build release APK
         if: steps.signing.outputs.enabled == 'true'
-        run: gradle -p android assembleRelease --no-daemon
+        run: |
+          gradle -p android assembleRelease --no-daemon
+
       - name: Sign release APK
         if: steps.signing.outputs.enabled == 'true'
         uses: r0adkll/sign-android-release@v1
@@ -77,12 +141,15 @@ jobs:
           alias: ${{ secrets.ANDROID_KEY_ALIAS }}
           keyStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
         with:
           name: reelradar-debug-apk-${{ github.run_number }}
           path: android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 30
+
       - name: Upload signed release APK
         if: steps.signing.outputs.enabled == 'true'
         uses: actions/upload-artifact@v4
@@ -91,6 +158,7 @@ jobs:
           path: android/app/build/outputs/apk/release/*-signed.apk
           if-no-files-found: error
           retention-days: 30
+
       - name: Attach APK to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
