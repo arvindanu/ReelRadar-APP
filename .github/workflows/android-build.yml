@@ -23,7 +23,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "22"
-          cache: "npm"
+          cache: npm
           cache-dependency-path: package-lock.json
 
       - name: Set up Java
@@ -55,7 +55,8 @@ jobs:
           npm install --no-audit --no-fund \
             @capacitor/core@^7 \
             @capacitor/cli@^7 \
-            @capacitor/android@^7
+            @capacitor/android@^7 \
+            @capacitor/status-bar@^7
 
           mkdir www
 
@@ -70,14 +71,41 @@ jobs:
               "url": "https://reelradar-ott-app.vercel.app",
               "cleartext": false
             },
-            "android": {
-              "allowMixedContent": false
+            "plugins": {
+              "StatusBar": {
+                "overlaysWebView": false,
+                "style": "DARK",
+                "backgroundColor": "#09090b"
+              }
             }
           }
           EOF
 
           npx cap add android
           npx cap sync android
+
+      - name: Configure Android status bar spacing
+        working-directory: android-wrapper/android
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          file = Path("variables.gradle")
+          content = file.read_text()
+
+          updated, count = re.subn(
+              r'(targetSdkVersion\s*=\s*)\d+',
+              r'\g<1>34',
+              content
+          )
+
+          if count != 1:
+              raise SystemExit("Could not safely update targetSdkVersion")
+
+          file.write_text(updated)
+          print("Android target SDK set to 34")
+          PY
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
