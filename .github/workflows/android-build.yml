@@ -1,24 +1,19 @@
-name: Android APK
+
+name: Build REELRADAR Android APK
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 permissions:
-  contents: write
-
-env:
-  NODE_VERSION: '22.16.0'
-  JAVA_VERSION: '21'
-  ANDROID_WEB_URL: ${{ vars.ANDROID_WEB_URL || 'https://reelradar-ott-app.vercel.app' }}
-  ANDROID_COMPILE_SDK: '35'
-  ANDROID_BUILD_TOOLS: '35.0.0'
+  contents: read
 
 jobs:
-  build:
-    runs-on: ubuntu-24.04
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
@@ -27,140 +22,76 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
+          node-version: "22"
+          cache: "npm"
           cache-dependency-path: package-lock.json
 
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: ${{ env.JAVA_VERSION }}
+          java-version: "21"
 
-      # CRITICAL FIX:
-      # Explicitly exclude the obsolete "tools" package.
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: 'platform-tools'
+          packages: "platform-tools"
 
       - name: Install Android SDK packages
-        shell: bash
         run: |
-          set -euo pipefail
-
+          yes | sdkmanager --licenses
           sdkmanager --install \
             "platform-tools" \
-            "platforms;android-${ANDROID_COMPILE_SDK}" \
-            "build-tools;${ANDROID_BUILD_TOOLS}"
+            "platforms;android-35" \
+            "build-tools;35.0.0"
 
-          yes | sdkmanager --licenses || true
-
-          echo "Android SDK installation completed."
-
-      - name: Verify Android SDK
+      - name: Create Capacitor Android project
         run: |
-          sdkmanager --list_installed
-          adb version
+          mkdir android-wrapper
+          cd android-wrapper
 
-      - name: Install web dependencies
-        run: npm ci
+          npm init -y
 
-      - name: Build and validate Next.js website
-        env:
-          TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
-        run: |
-          set -e
+          npm install --no-audit --no-fund \
+            @capacitor/core@^7 \
+            @capacitor/cli@^7 \
+            @capacitor/android@^7
 
-          test -n "$ANDROID_WEB_URL" || {
-            echo "::error::Set the ANDROID_WEB_URL repository variable."
-            exit 1
+          mkdir www
+
+          echo '<!DOCTYPE html><html><head><title>REELRADAR</title></head><body>Loading REELRADAR...</body></html>' > www/index.html
+
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "com.reelradar.app",
+            "appName": "REELRADAR",
+            "webDir": "www",
+            "server": {
+              "url": "https://reelradar-ott-app.vercel.app",
+              "cleartext": false
+            },
+            "android": {
+              "allowMixedContent": false
+            }
           }
+          EOF
 
-          npm run build
-
-      - name: Install pinned Capacitor toolchain
-        run: |
-          npm install --no-save --no-package-lock \
-            @capacitor/core@7.4.3 \
-            @capacitor/android@7.4.3 \
-            @capacitor/cli@7.4.3 \
-            @capacitor/app@7.1.0
-
-      - name: Generate and sync Android project
-        run: |
           npx cap add android
           npx cap sync android
 
-      - name: Set Android version
-        run: |
-          set -e
-
-          sed -i "s/versionCode [0-9]*/versionCode ${GITHUB_RUN_NUMBER}/" android/app/build.gradle
-
-          sed -i 's/versionName "[^"]*"/versionName "1.0.'"${GITHUB_RUN_NUMBER}"'"/' android/app/build.gradle
-
-      - name: Set up Gradle and cache
+      - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.11.1'
 
-      - name: Build debug APK
-        run: gradle -p android assembleDebug --no-daemon
-
-      - name: Check signing configuration
-        id: signing
-        env:
-          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      - name: Build Debug APK
+        working-directory: android-wrapper/android
         run: |
-          if [ -n "$KEYSTORE_B64" ] && \
-             [ -n "$KEY_ALIAS" ] && \
-             [ -n "$KEYSTORE_PASSWORD" ] && \
-             [ -n "$KEY_PASSWORD" ]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "Signing secrets are absent or incomplete; debug APK will still be produced."
-          fi
+          chmod +x gradlew
+          ./gradlew assembleDebug
 
-      - name: Build release variant
-        if: steps.signing.outputs.enabled == 'true'
-        run: gradle -p android assembleRelease --no-daemon
-
-      - name: Sign release APK
-        if: steps.signing.outputs.enabled == 'true'
-        uses: r0adkll/sign-android-release@v1
-        with:
-          releaseDirectory: android/app/build/outputs/apk/release
-          signingKeyBase64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          alias: ${{ secrets.ANDROID_KEY_ALIAS }}
-          keyStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
-
-      - name: Upload debug APK
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: reelradar-debug-apk-${{ github.run_number }}
-          path: android/app/build/outputs/apk/debug/*.apk
+          name: REELRADAR-Android-APK
+          path: android-wrapper/android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
-
-      - name: Upload signed release APK
-        if: steps.signing.outputs.enabled == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: reelradar-release-apk-${{ github.run_number }}
-          path: android/app/build/outputs/apk/release/*-signed.apk
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Attach APK to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            android/app/build/outputs/apk/debug/*.apk
-            android/app/build/outputs/apk/release/*-signed.apk
